@@ -1,4 +1,4 @@
-"""MCP server：3 个只读工具，全部由 api.py 的注册表驱动。
+"""MCP server：查询与提交工具，共用 api.py 客户端。
 
 运行：``python -m arcbench_mcp.server``（stdio transport）。
 """
@@ -14,8 +14,8 @@ from .api import DOWNLOADS, RESOURCES, ArcBenchClient, ArcBenchError
 mcp = FastMCP(
     "arcbench",
     instructions=(
-        "ARC-Bench（arc-bench.com）只读访问：查比赛/提交分数、下载提交 zip、"
-        "浏览 run 工作区与日志、对比两次提交的每任务得分。写操作（提交/取消）只在 CLI 提供。"
+        "ARC-Bench（arc-bench.com）访问：查比赛/提交分数、下载提交 zip、"
+        "浏览 run 工作区与日志、对比两次提交的每任务得分。arc_submit 可在用户明确要求上传并运行时创建提交、run 并启动；取消仍通过 CLI。"
     ),
 )
 
@@ -60,6 +60,29 @@ def arc_api(resource: str, params: dict[str, Any] | None = None) -> Any:
 @mcp.tool(description=_ARC_DOWNLOAD_DOC)
 def arc_download(kind: str, id: str, out_dir: str | None = None) -> dict:
     return _client().download(kind, id, out_dir)
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False})
+def arc_submit(
+    zip_path: str,
+    requirement_id: str,
+    api_key: str,
+    base_url: str = "https://api.arc-bench.com/v1",
+    competition_id: str | None = None,
+    display_name: str | None = None,
+    model: str | None = None,
+) -> dict:
+    """上传本地 agent ZIP、创建 run 并启动（计费写操作）。
+
+    仅在用户明确要求提交/启动时调用。Python ZIP 根需 main.py 和 requirements.txt。
+    先用 arc_api 查询比赛和任务 ID。api_key 由用户提供，不写入源码或返回值。
+    不自动重试写请求；如中途失败，使用错误中的 submission_id/run_id 查询并恢复，
+    勿重新上传以免重复创建运行。默认模型由 agent 代码选择；model 可省略。
+    """
+    return _client().submit(
+        zip_path, requirement_id, api_key=api_key, base_url=base_url,
+        competition_id=competition_id, display_name=display_name, model=model,
+    )
 
 
 @mcp.tool()

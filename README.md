@@ -1,6 +1,6 @@
 # arcbench-mcp
 
-ARC-Bench（[arc-bench.com](https://arc-bench.com)）的 MCP server + CLI：**拉取提交 zip、查历史分数与榜单、浏览 run 工作区与日志、对比两次提交的每任务得分**。写操作（提交/取消/重跑）只在 CLI 提供，人工确认。
+ARC-Bench（[arc-bench.com](https://arc-bench.com)）的 MCP server + CLI：**拉取提交 zip、查历史分数与榜单、浏览 run 工作区与日志、对比两次提交的每任务得分**。提交并启动可通过 MCP 的 `arc_submit` 或 CLI 执行；取消/重跑仍通过 CLI。提交会产生模型费用，只在用户明确要求运行时调用。
 
 架构：`arcbench_mcp/api.py` 里的两张注册表（`RESOURCES` / `DOWNLOADS`）是唯一事实源——MCP 工具、CLI 子命令、工具文档全部由它生成，加能力 = 加一行。
 
@@ -34,13 +34,22 @@ ARCBENCH_COOKIE='arcbench_session=...; arc_api_sticky=...'
 
 也支持 Cookie 管理器导出的 JSON 数组格式（`[{"name":...,"value":...}]`），或存到单独文件用 `ARCBENCH_COOKIE_FILE` 指向。注意：cookie 即账号凭证，不要提交进 git（已在 `.gitignore`）。
 
-## MCP 工具（3 个，全部只读）
+## MCP 工具（3 个只读，1 个提交工具）
 
 | 工具 | 作用 |
 |---|---|
 | `arc_api(resource, params)` | 查询全部只读资源，JSON 原样返回。resource 由注册表枚举：`me` / `competitions` / `competition` / `tasks` / `task` / `task_tests` / `submissions` / `runs` / `run` / `leaderboard` / `workspace_files` / `file` / `logs` |
 | `arc_download(kind, id)` | 下载 zip 并列出内含文件清单：`project_zip`（run 工作区包）/ `archive`（提交评测快照）/ `competition_requirements` / `initial_projects` |
 | `arc_compare(idA, idB)` | 两次提交的每任务得分对比 → markdown 报告 |
+| `arc_submit(zip_path, requirement_id, api_key, base_url, competition_id, display_name, model)` | 上传 Python agent ZIP、创建 run 并启动；计费写操作 |
+
+### 提交与连接恢复
+
+先用 `arc_api` 查询比赛和任务 ID，再调用 `arc_submit`。`zip_path` 为 MCP server 所在机器的文件路径，ZIP 根需包含 `main.py` 和 `requirements.txt`。`base_url` 默认 `https://api.arc-bench.com/v1`，`model` 可省略以沿用 agent 自身配置。凭证只发给已配置的 ARC-Bench 站点，不写入仓库或工具返回值；不要把真实 key 写进文档或示例配置。
+
+工具依次上传、创建 run、启动。中途出错会返回失败阶段和已创建的 submission/run ID；先查询这些资源再恢复操作，避免重复上传或启动。没有收到创建响应时也应先查提交列表，不能假定服务器未创建资源。
+
+HTTP 首选 httpx；仅在连接建立失败、HTTP 请求尚未发送时回退到系统 curl，保持 TLS 证书验证。读取超时、写入错误和非 2xx 响应均不会自动重放。curl 的认证头放在权限为 0600 的临时文件中，请求体通过 stdin 传入，不出现在进程参数中，结束后删除临时文件。使用回退需要系统安装 curl。
 
 ## ZCode / Claude 接入
 

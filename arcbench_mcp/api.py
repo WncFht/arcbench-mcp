@@ -1,7 +1,7 @@
 """ARC-Bench API：注册表 + HTTP 客户端。
 
 两张表是本包唯一的事实源，加能力 = 加一行，MCP 工具、CLI、工具文档随之更新：
-- RESOURCES  JSON 端点（safe=True 的才暴露给 MCP；写操作仅 CLI 调用）
+- RESOURCES  JSON 端点（safe=True 的才暴露给 MCP；提交可由 MCP 或 CLI 调用，其余写操作仅 CLI）
 - DOWNLOADS  zip 二进制端点
 
 路径模板约定：``{name}`` 为参数占位符；``?`` 之后的查询段里，字面量键值对
@@ -20,6 +20,8 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
+
+from .transport import CompatibleTransport
 
 DEFAULT_BASE_URL = "https://arc-bench.com/api"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -69,7 +71,7 @@ RESOURCES: dict[str, Resource] = {
     "workspace_files": Resource("GET", "/runs/{id}/workspace/files", note="工作区文件树"),
     "file":            Resource("GET", "/runs/{id}/source?file_path={file_path}&kind={kind}", note="工作区单文件源码"),
     "logs":            Resource("GET", "/runs/{id}/logs?log_offset={log_offset}&after_event_id={after_event_id}", note="运行日志与事件，参数均可选"),
-    # 写操作：MCP 不可见，仅 CLI（人工确认）
+    # 写操作：不通过通用 arc_api 暴露，提交走独立工具或 CLI
     "submit":          Resource("POST", "/submissions", safe=False, note="提交 zip 并开跑（三步链）"),
     "cancel":          Resource("POST", "/runs/{id}/cancel", safe=False, note="取消 run"),
     "rerun":           Resource("POST", "/runs/{id}/rerun", safe=False, note="重跑 run"),
@@ -193,6 +195,7 @@ class ArcBenchClient:
             base_url=self.base_url,
             headers={"Cookie": self.cookie, "Accept": "application/json"},
             timeout=timeout,
+            transport=CompatibleTransport(),
         )
 
     # -- 查表调用 -----------------------------------------------------------
@@ -260,7 +263,7 @@ class ArcBenchClient:
             entries = zf.namelist()
         return {"path": str(target), "size": len(response.content), "entries": entries}
 
-    # -- 写操作（仅 CLI） ----------------------------------------------------
+    # -- 写操作（独立 MCP 工具 / CLI） ----------------------------------------------------
     def submit(
         self,
         zip_path: str | Path,
@@ -275,7 +278,7 @@ class ArcBenchClient:
         runtime: str = "python",
         catalog: str = "competition",
     ) -> dict:
-        """三步链：创建提交（multipart）→ 创建 run → 启动。**计费操作**。"""
+        """三步链：创建提交（multipart）→ 创建 run → 启动。计费操作，不自动重试。"""
         zip_file = Path(zip_path)
         if not zip_file.is_file():
             raise ArcBenchError(f"zip 不存在: {zip_file}")
@@ -296,11 +299,33 @@ class ArcBenchClient:
             if value:
                 data[key] = value
 
-        created = self._request("POST", "/submissions", data=data, files={"file": (zip_file.name, zip_file.read_bytes(), "application/zip")})
-        submission_id = _unwrap_id(created, "submission")
-        run = self._request("POST", "/runs", data={"submission_id": submission_id, "requirement_id": requirement_id})
-        run_id = _unwrap_id(run, "run")
-        started = self._request("POST", f"/runs/{run_id}/start")
+        # Validate locally before creating any remote resource.
+        try:
+            with zipfile.ZipFile(zip_file) as archive:
+                if archive.testzip() is not None:
+                    raise ArcBenchError("zip 校验失败")
+                if runtime == "python" and not {"main.py", "requirements.txt"} <= set(archive.namelist()):
+                    raise ArcBenchError("Python 提交的 zip 根目录必须包含 main.py 和 requirements.txt")
+        except zipfile.BadZipFile:
+            raise ArcBenchError("提交文件不是有效 zip") from None
+        if not api_key or not base_url:
+            raise ArcBenchError("提交需要 base_url 和 api_key")
+        submission_id = run_id = None
+        stage = "create_submission"
+        try:
+            created = self._request("POST", "/submissions", data=data, files={"file": (zip_file.name, zip_file.read_bytes(), "application/zip")})
+            submission_id = _unwrap_id(created, "submission")
+            stage = "create_run"
+            run = self._request("POST", "/runs", data={"submission_id": submission_id, "requirement_id": requirement_id})
+            run_id = _unwrap_id(run, "run")
+            stage = "start_run"
+            started = self._request("POST", f"/runs/{run_id}/start")
+        except (ArcBenchError, httpx.HTTPError) as exc:
+            detail = str(exc).replace(api_key, "[REDACTED]")
+            raise ArcBenchError(
+                f"提交在 {stage} 阶段失败；submission_id={submission_id}, run_id={run_id}。"
+                f"请先查询服务器状态，勿直接重复提交。{detail}"
+            ) from None
         return {"submission_id": submission_id, "run_id": run_id, "start": started}
 
     def cancel(self, run_id: str) -> Any:
